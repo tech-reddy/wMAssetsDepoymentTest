@@ -1,0 +1,108 @@
+pipeline {
+    agent any
+
+    // 1. Define global parameters the user can pick when running the build
+    parameters {
+        string(name: 'BRANCH_NAME', defaultValue: 'main', description: 'The Git branch you want to deploy.')
+    }
+
+    // 2. Define global environment variables for the SAG installation paths
+    environment {
+        // Retrieve credential string safely from Jenkins Credentials Vault
+        DEPLOYER_PASS      = credentials('wM-deployer-password-id')
+        GITHUB_CREDS       = 'github-service-account-id'
+        
+        // Software AG Core Homes
+        SAG_HOME           = '/softwareAG1101'
+        JAVA_HOME          = "${env.SAG_HOME}/jvm/jvm"
+        ANT_HOME           = "${env.SAG_HOME}/common/lib/ant"
+        
+        // Tool Binaries Paths
+        ABE_BIN            = "${env.SAG_HOME}/common/AssetBuildEnvironment/bin"
+        DEPLOYER_BIN       = "${env.SAG_HOME}/IntegrationServer/instances/default/packages/WmDeployer/bin"
+        
+        // Update System Path so execution steps automatically find Java and Ant
+        PATH               = "${env.JAVA_HOME}/bin:${env.ANT_HOME}/bin:${env.PATH}"
+    }
+
+    stages {
+        
+        stage('Checkout Source') {
+            steps {
+                echo "Pulling source from branch: ${params.BRANCH_NAME}"
+                git branch: "${params.BRANCH_NAME}", 
+                    credentialsId: "${env.GITHUB_CREDS}", 
+                    url: 'https://github.com/your-org/wm-devops-pipeline.git'
+            }
+        }
+
+        stage('Prepare Workspace') {
+            steps {
+                echo "Cleaning up previous build artifacts..."
+                // Ensure a clean target directory exists for ABE binaries
+                sh '''
+                    rm -rf ${WORKSPACE}/build_output
+                    mkdir -p ${WORKSPACE}/build_output
+                '''
+                
+                echo "Injecting absolute paths into Project Automator template..."
+                // Replaces the @WORKSPACE_DIR@ token in your XML template with the real Jenkins path
+                sh "sed 's|@WORKSPACE_DIR@|${WORKSPACE}|g' ${WORKSPACE}/build/project_template.xml > ${WORKSPACE}/build/project_config.xml"
+            }
+        }
+
+        stage('Execute ABE Build') {
+            steps {
+                echo "Verifying underlying Apache Ant Engine version..."
+                sh "ant -version"
+                
+                echo "Running webMethods Asset Build Environment..."
+                sh """
+                    cd ${env.ABE_BIN}
+                    ./build.sh -Dworkspace.dir=${WORKSPACE} -Dbuild.properties=${WORKSPACE}/build/build.properties
+                """
+            }
+        }
+
+        stage('Map via Project Automator') {
+            steps {
+                echo "Creating Deployment Specification Candidate..."
+                sh """
+                    cd ${env.DEPLOYER_BIN}
+                    ./projectAutomator.sh ${WORKSPACE}/build/project_config.xml
+                """
+            }
+        }
+
+        stage('Execute Deployment') {
+            steps {
+                echo "Triggering WmDeployer runtime execution..."
+                // Sensitive target credentials are cleanly passed via environment variables
+                sh """
+                    cd ${env.DEPLOYER_BIN}
+                    ./deployer.sh --deploy \
+                                  -project "Automated_Deployment_Project" \
+                                  -dc "Execute_Release" \
+                                  -host "target-deployer-host-server" \
+                                  -port 5555 \
+                                  -user "administrator" \
+                                  -pwd "${env.DEPLOYER_PASS}"
+                """
+            }
+        }
+    }
+
+    // 3. Post-execution handling for notifications and workspace maintenance
+    post {
+        success {
+            echo "CI/CD Pipeline finished successfully! Custom packages are live."
+        }
+        failure {
+            echo "Pipeline failed. Review build_output logs or connection parameters above."
+        }
+        always {
+            echo "Cleaning up workspace dynamic artifacts..."
+            sh "rm -rf ${WORKSPACE}/build_output"
+        }
+    }
+}
